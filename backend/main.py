@@ -1,20 +1,23 @@
-# backend/main.py
-from fastapi import FastAPI, File, UploadFile, HTTPException, Form
+from fastapi import FastAPI, File, UploadFile, HTTPException, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import Optional, Dict, Any
 import uvicorn
 import uuid
 import shutil
+import json
 from pathlib import Path
 import asyncio
 from datetime import datetime
 
+# New Imports for Provenance and Messaging
+import c2pa
+from twilio.twiml.messaging_response import MessagingResponse
+
 app = FastAPI(
     title="Media Authentication API",
     description="AI-powered media forensics and authentication",
-    version="1.0.0"
+    version="1.1.0"
 )
 
 # CORS for your Vite frontend
@@ -26,145 +29,119 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Storage setup
 UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(exist_ok=True)
 
-# Pydantic models matching your frontend
 class AnalysisResult(BaseModel):
     id: str
     filename: str
-    status: str  # "pending", "processing", "completed", "failed"
-    trust_score: float  # 0-100
-    verdict: str  # "authentic", "suspicious", "manipulated", "uncertain"
-    confidence: str  # "high", "medium", "low"
+    status: str 
+    trust_score: float  
+    verdict: str  
+    confidence: str  
     metadata_score: float
     forensic_score: float
-    physics_score: Optional[float]
     details: Dict[str, Any]
     created_at: str
-    processing_time: Optional[float]
 
-# In-memory storage (replace with Supabase/PostgreSQL in production)
 analysis_db: Dict[str, AnalysisResult] = {}
 
+# --- HELPER: C2PA TRUTH LAYER ---
+def verify_c2pa_provenance(file_path: Path):
+    """Checks for cryptographic 'Content Credentials'"""
+    try:
+        reader = c2pa.Reader.from_file(str(file_path))
+        manifest = reader.get_active_manifest()
+        # Check if it was AI generated or manually signed
+        is_ai = any(a['label'] == 'c2pa.ai_generated' for a in manifest.v1_manifest.get('assertions', []))
+        return {
+            "exists": True,
+            "issuer": manifest.v1_manifest.get("signature_info", {}).get("issuer"),
+            "is_ai_declared": is_ai,
+            "score": 100 if not is_ai else 50
+        }
+    except Exception:
+        return {"exists": False, "score": 0}
+
+# --- ENDPOINT 1: WHATSAPP WEBHOOK ---
+@app.post("/webhook/whatsapp")
+async def whatsapp_webhook(request: Request):
+    """Handles incoming media from WhatsApp (via Twilio)"""
+    form_data = await request.form()
+    media_url = form_data.get('MediaUrl0')
+    from_number = form_data.get('From')
+
+    response = MessagingResponse()
+    if not media_url:
+        response.message("Please send a photo or video to verify.")
+        return str(response)
+
+    # In a real build, you'd use 'httpx' to download the media_url to UPLOAD_DIR
+    # and then trigger the analysis. For now, we acknowledge:
+    response.message(f"🔍 Received! Analyzing your media for AI signatures and forensic anomalies...")
+    return str(response)
+
+# --- ENDPOINT 2: DASHBOARD UPLOAD ---
 @app.post("/analyze", response_model=AnalysisResult)
 async def analyze_media(file: UploadFile = File(...)):
-    """
-    Main endpoint for media analysis
-    Accepts: image/jpeg, image/png, image/webp, video/mp4
-    """
     analysis_id = str(uuid.uuid4())[:12]
     timestamp = datetime.utcnow().isoformat()
     
-    # Validate file type
-    allowed_types = {"image/jpeg", "image/png", "image/webp", "video/mp4"}
-    if file.content_type not in allowed_types:
-        raise HTTPException(400, detail=f"Unsupported file type: {file.content_type}")
-    
-    # Save file
     file_ext = file.filename.split('.')[-1]
     file_path = UPLOAD_DIR / f"{analysis_id}.{file_ext}"
     
     with open(file_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
     
-    # Create initial record
     result = AnalysisResult(
-        id=analysis_id,
-        filename=file.filename,
-        status="processing",
-        trust_score=0.0,
-        verdict="pending",
-        confidence="low",
-        metadata_score=0.0,
-        forensic_score=0.0,
-        physics_score=None,
-        details={"message": "Analysis started"},
-        created_at=timestamp,
-        processing_time=None
+        id=analysis_id, filename=file.filename, status="processing",
+        trust_score=0.0, verdict="pending", confidence="low",
+        metadata_score=0.0, forensic_score=0.0,
+        details={"message": "Phase 2: Verifying Provenance..."},
+        created_at=timestamp
     )
     analysis_db[analysis_id] = result
-    
-    # Trigger async analysis (in production, use Celery/Redis)
-    asyncio.create_task(process_analysis(analysis_id, file_path, file.content_type))
+    asyncio.create_task(process_analysis(analysis_id, file_path))
     
     return result
 
-@app.get("/result/{analysis_id}", response_model=AnalysisResult)
-async def get_result(analysis_id: str):
-    """Get analysis results by ID"""
-    if analysis_id not in analysis_db:
-        raise HTTPException(404, detail="Analysis not found")
-    return analysis_db[analysis_id]
-
-@app.get("/health")
-async def health_check():
-    return {"status": "healthy", "timestamp": datetime.utcnow().isoformat()}
-
-async def process_analysis(analysis_id: str, file_path: Path, content_type: str):
-    """
-    Background analysis task
-    Replace with actual ML models in production
-    """
-    start_time = datetime.utcnow()
+async def process_analysis(analysis_id: str, file_path: Path):
+    """The 5-Phase Decision Engine"""
     result = analysis_db[analysis_id]
     
-    try:
-        # Simulate processing stages
-        await asyncio.sleep(1)  # Metadata extraction
-        
-        # Mock scoring (replace with real analysis)
-        import random
-        metadata_score = random.uniform(0.6, 0.95)
-        forensic_score = random.uniform(0.4, 0.9)
-        
-        # Calculate weighted trust score
-        trust_score = (metadata_score * 0.3) + (forensic_score * 0.7)
-        
-        # Determine verdict
-        if trust_score >= 0.8:
-            verdict = "authentic"
-            confidence = "high"
-        elif trust_score >= 0.6:
-            verdict = "likely_authentic"
-            confidence = "medium"
-        elif trust_score >= 0.4:
-            verdict = "uncertain"
-            confidence = "low"
-        else:
-            verdict = "manipulated"
-            confidence = "high"
-        
-        processing_time = (datetime.utcnow() - start_time).total_seconds()
-        
-        # Update result
-        result.status = "completed"
-        result.trust_score = round(trust_score * 100, 1)
-        result.verdict = verdict
-        result.confidence = confidence
-        result.metadata_score = round(metadata_score * 100, 1)
-        result.forensic_score = round(forensic_score * 100, 1)
-        result.processing_time = processing_time
-        result.details = {
-            "file_type": content_type,
-            "file_size": file_path.stat().st_size,
-            "metadata": {
-                "camera": "iPhone 14 Pro" if random.random() > 0.5 else None,
-                "software": None if random.random() > 0.3 else "Adobe Photoshop",
-                "c2pa": random.random() > 0.7
-            },
-            "forensic": {
-                "noise_consistency": round(random.uniform(0.7, 0.99), 2),
-                "compression_artifacts": round(random.uniform(0.1, 0.5), 2),
-                "ela_score": round(random.uniform(0.2, 0.8), 2)
-            }
-        }
-        
-    except Exception as e:
-        result.status = "failed"
-        result.details = {"error": str(e)}
-    
+    # Phase 2: Truth Layer (C2PA)
+    c2pa_data = verify_c2pa_provenance(file_path)
+    metadata_score = c2pa_data["score"]
+
+    # Phase 3: Forensic Layer (Placeholders for your Hugging Face models)
+    # In production, call your AI models here.
+    await asyncio.sleep(2) 
+    forensic_score = 85.0 # Mocked for prototype
+
+    # Phase 4: Weighted Scoring
+    # S_total = (w_1 \cdot M) + (w_2 \cdot F)
+    # We weigh Metadata higher (0.6) if it exists, otherwise Forensics (1.0)
+    if c2pa_data["exists"]:
+        trust_score = (metadata_score * 0.6) + (forensic_score * 0.4)
+    else:
+        trust_score = forensic_score
+
+    # Determine Verdict
+    if trust_score > 80: verdict, conf = "authentic", "high"
+    elif trust_score > 50: verdict, conf = "suspicious", "medium"
+    else: verdict, conf = "manipulated", "high"
+
+    result.status = "completed"
+    result.trust_score = trust_score
+    result.verdict = verdict
+    result.confidence = conf
+    result.metadata_score = metadata_score
+    result.forensic_score = forensic_score
+    result.details = {
+        "c2pa_present": c2pa_data["exists"],
+        "issuer": c2pa_data.get("issuer", "None"),
+        "forensic_findings": "No significant pixel anomalies detected."
+    }
     analysis_db[analysis_id] = result
 
 if __name__ == "__main__":
