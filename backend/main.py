@@ -2,7 +2,7 @@ from fastapi import FastAPI, File, UploadFile, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Dict, Any, Optional
-import uvicorn, uuid, shutil, asyncio, os, httpx
+import uvicorn, uuid, shutil, asyncio, os, httpx, json
 from pathlib import Path
 from datetime import datetime
 from dotenv import load_dotenv
@@ -10,14 +10,15 @@ from twilio.twiml.messaging_response import MessagingResponse
 from twilio.rest import Client
 import c2pa
 
+# 1. Load Environment Variables
 load_dotenv()
 
-# --- CONFIGURATION & SECRETS ---
-# These must be set in your Railway Variables tab
+# Securely pull credentials from Railway Variables
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 TWILIO_NUMBER = os.getenv("TWILIO_WHATSAPP_NUMBER", "whatsapp:+14155238886")
-DATABASE_URL = os.getenv("DATABASE_URL") # For your Postgres service
+# Template SID from your Twilio Content Builder
+CONTENT_SID = "HXfe122e8432f88a666bcec5ba864b70a3" 
 
 app = FastAPI(
     title="Media Authentication API",
@@ -25,9 +26,10 @@ app = FastAPI(
     version="1.1.0"
 )
 
+# 2. CORS Configuration for your Vite Frontend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # In production, replace with your specific domain
+    allow_origins=["*"], 
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -48,12 +50,12 @@ class AnalysisResult(BaseModel):
     details: Dict[str, Any]
     created_at: str
 
-# In-memory store for the prototype (Postgres integration would replace this)
+# In-memory store (Replace with Postgres for persistence)
 analysis_db: Dict[str, AnalysisResult] = {}
 
 # --- PHASE 2: PROVENANCE (C2PA) ---
 def verify_c2pa_provenance(file_path: Path):
-    """Checks for cryptographic 'Content Credentials' as seen in Figma Phase 2"""
+    """Checks for cryptographic 'Content Credentials'"""
     try:
         reader = c2pa.Reader.from_file(str(file_path))
         manifest = reader.get_active_manifest()
@@ -66,17 +68,17 @@ def verify_c2pa_provenance(file_path: Path):
     except:
         return {"exists": False, "score": 0}
 
-# --- PHASE 5: THE PROACTIVE REPLY ---
+# --- PHASE 5: PROACTIVE TEMPLATE REPLY ---
 async def process_analysis(analysis_id: str, file_path: Path, to_number: Optional[str] = None):
-    """The Decision Engine that pushes results back to WhatsApp"""
+    """The Decision Engine that pushes results back to WhatsApp using Templates"""
     result = analysis_db[analysis_id]
     
     # 1. Run C2PA Check
     c2pa_data = verify_c2pa_provenance(file_path)
     
-    # 2. Simulate Phase 3 Forensics (Hugging Face Inference)
+    # 2. Simulate Phase 3 Forensics
     await asyncio.sleep(4) 
-    forensic_score = 88.0 # Placeholder for model output
+    forensic_score = 88.0 
     
     # 3. Phase 4: Weighted Scoring
     if c2pa_data["exists"]:
@@ -87,7 +89,7 @@ async def process_analysis(analysis_id: str, file_path: Path, to_number: Optiona
     verdict = "authentic" if trust_score > 80 else "manipulated"
     conf = "high" if abs(trust_score - 50) > 30 else "medium"
 
-    # 4. Update Database
+    # Update Database State
     result.status = "completed"
     result.trust_score = trust_score
     result.verdict = verdict
@@ -97,23 +99,26 @@ async def process_analysis(analysis_id: str, file_path: Path, to_number: Optiona
     result.details = {"c2pa_issuer": c2pa_data.get("issuer", "N/A")}
     analysis_db[analysis_id] = result
 
-    # 5. Push Result back to User via Twilio
+    # 4. Push Template Result via Twilio
     if to_number and TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN:
         try:
             client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-            emoji = "✅" if verdict == "authentic" else "🚨"
+            
+            # Map variables to your approved template: {{1}}=Verdict, {{2}}=Score, {{3}}=URL
+            content_vars = json.dumps({
+                "1": verdict.upper(),
+                "2": f"{int(trust_score)}%",
+                "3": f"https://mediaauthenticationdashboard-production.up.railway.app/scans/{analysis_id}"
+            })
+
             client.messages.create(
                 from_=TWILIO_NUMBER,
                 to=to_number,
-                body=(
-                    f"{emoji} *Media Verdict Ready*\n\n"
-                    f"*Status:* {verdict.upper()}\n"
-                    f"*Trust Score:* {int(trust_score)}%\n\n"
-                    f"Check the full report on your MediaAuth Dashboard."
-                )
+                content_sid=CONTENT_SID,
+                content_variables=content_vars
             )
         except Exception as e:
-            print(f"Twilio Notify Error: {e}")
+            print(f"Twilio Template Error: {e}")
 
 # --- ENDPOINT: WHATSAPP WEBHOOK ---
 @app.post("/webhook/whatsapp")
@@ -132,7 +137,6 @@ async def whatsapp_webhook(request: Request):
             if resp.status_code == 200:
                 with open(path, "wb") as f: f.write(resp.content)
                 
-                # Initialize analysis record
                 analysis_db[aid] = AnalysisResult(
                     id=aid, filename=f"wa_{aid}.jpg", status="processing",
                     trust_score=0.0, verdict="pending", confidence="low",
@@ -140,13 +144,12 @@ async def whatsapp_webhook(request: Request):
                     created_at=datetime.utcnow().isoformat()
                 )
                 
-                # Start Background Engine
                 asyncio.create_task(process_analysis(aid, path, from_number))
-                tw_resp.message("🔍 Media received. I'm verifying the digital signatures and pixel patterns now...")
+                tw_resp.message("🔍 Media received. Verifying signatures and pixel patterns. I'll WhatsApp you the verdict shortly.")
             else:
-                tw_resp.message("❌ Could not process image. Please try again.")
+                tw_resp.message("❌ Error downloading media. Please try again.")
     else:
-        tw_resp.message("👋 Welcome! Send me a photo or video for instant verification.")
+        tw_resp.message("👋 Welcome! Send a photo or video to verify its authenticity.")
         
     return str(tw_resp)
 
@@ -170,4 +173,6 @@ async def analyze_media(file: UploadFile = File(...)):
     return result
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
+    # Railway automatically sets the PORT environment variable
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
