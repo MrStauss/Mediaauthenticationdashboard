@@ -17,7 +17,8 @@ load_dotenv()
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 TWILIO_NUMBER = os.getenv("TWILIO_WHATSAPP_NUMBER", "whatsapp:+14155238886")
-# Template SID from your Twilio Content Builder
+
+# Corrected Template SID from your Twilio Content Builder
 CONTENT_SID = "HXfe122e8432f88a666bcec5ba864b70a3" 
 
 app = FastAPI(
@@ -50,12 +51,12 @@ class AnalysisResult(BaseModel):
     details: Dict[str, Any]
     created_at: str
 
-# In-memory store (Replace with Postgres for persistence)
+# In-memory store (Postgres integration would replace this for persistence)
 analysis_db: Dict[str, AnalysisResult] = {}
 
 # --- PHASE 2: PROVENANCE (C2PA) ---
 def verify_c2pa_provenance(file_path: Path):
-    """Checks for cryptographic 'Content Credentials'"""
+    """Checks for cryptographic 'Content Credentials' as seen in Figma Phase 2"""
     try:
         reader = c2pa.Reader.from_file(str(file_path))
         manifest = reader.get_active_manifest()
@@ -137,6 +138,7 @@ async def whatsapp_webhook(request: Request):
             if resp.status_code == 200:
                 with open(path, "wb") as f: f.write(resp.content)
                 
+                # Initialize analysis record
                 analysis_db[aid] = AnalysisResult(
                     id=aid, filename=f"wa_{aid}.jpg", status="processing",
                     trust_score=0.0, verdict="pending", confidence="low",
@@ -144,6 +146,7 @@ async def whatsapp_webhook(request: Request):
                     created_at=datetime.utcnow().isoformat()
                 )
                 
+                # Start Background Engine
                 asyncio.create_task(process_analysis(aid, path, from_number))
                 tw_resp.message("🔍 Media received. Verifying signatures and pixel patterns. I'll WhatsApp you the verdict shortly.")
             else:
@@ -171,6 +174,13 @@ async def analyze_media(file: UploadFile = File(...)):
     analysis_db[aid] = result
     asyncio.create_task(process_analysis(aid, path))
     return result
+
+# --- ENDPOINT: GET INDIVIDUAL SCAN ---
+@app.get("/scans/{scan_id}", response_model=AnalysisResult)
+async def get_scan(scan_id: str):
+    if scan_id not in analysis_db:
+        raise HTTPException(status_code=404, detail="Scan not found")
+    return analysis_db[scan_id]
 
 if __name__ == "__main__":
     # Railway automatically sets the PORT environment variable
