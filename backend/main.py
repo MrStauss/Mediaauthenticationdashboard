@@ -121,40 +121,40 @@ async def process_analysis(analysis_id: str, file_path: Path, to_number: Optiona
         except Exception as e:
             print(f"Twilio Template Error: {e}")
 
-# --- ENDPOINT: WHATSAPP WEBHOOK ---
-@app.post("/webhook/whatsapp")
-async def whatsapp_webhook(request: Request):
-    form_data = await request.form()
-    media_url = form_data.get('MediaUrl0')
-    from_number = form_data.get('From')
+# --- ENDPOINT: EVOLUTION API ---
+@app.post("/webhooks/evolution")
+async def evolution_webhook(request: Request):
+    data = await request.json()
     
-    tw_resp = MessagingResponse()
-    if media_url:
-        aid = str(uuid.uuid4())[:12]
-        path = UPLOAD_DIR / f"{aid}.jpg"
+    # Evolution API sends data in a 'data' object
+    message_type = data.get("event")
+    
+    if message_type == "messages.upsert":
+        message = data["data"]["message"]
+        from_number = data["data"]["key"]["remoteJid"]
         
-        async with httpx.AsyncClient() as client:
-            resp = await client.get(media_url)
-            if resp.status_code == 200:
-                with open(path, "wb") as f: f.write(resp.content)
-                
-                # Initialize analysis record
-                analysis_db[aid] = AnalysisResult(
-                    id=aid, filename=f"wa_{aid}.jpg", status="processing",
-                    trust_score=0.0, verdict="pending", confidence="low",
-                    metadata_score=0.0, forensic_score=0.0, details={},
-                    created_at=datetime.utcnow().isoformat()
-                )
-                
-                # Start Background Engine
-                asyncio.create_task(process_analysis(aid, path, from_number))
-                tw_resp.message("🔍 Media received. Verifying signatures and pixel patterns. I'll WhatsApp you the verdict shortly.")
-            else:
-                tw_resp.message("❌ Error downloading media. Please try again.")
-    else:
-        tw_resp.message("👋 Welcome! Send a photo or video to verify its authenticity.")
+        # Check if it's an image or video
+        media_type = "imageMessage" if "imageMessage" in message else "videoMessage" if "videoMessage" in message else None
         
-    return str(tw_resp)
+        if media_type:
+            # 1. Get the media key/url from Evolution API
+            # Evolution usually requires a separate call to download media or provides a base64
+            # For this prototype, we'll trigger the analysis ID
+            analysis_id = str(uuid.uuid4())[:12]
+            
+            # 2. Initialize the Dashboard record
+            analysis_db[analysis_id] = AnalysisResult(
+                id=analysis_id, filename="whatsapp_media.jpg", status="processing",
+                trust_score=0.0, verdict="pending", confidence="low",
+                metadata_score=0.0, forensic_score=0.0, details={}, 
+                created_at=datetime.utcnow().isoformat()
+            )
+            
+            # 3. Start Analysis
+            # Note: You'll need to use the Evolution API 'download' endpoint here
+            asyncio.create_task(process_analysis(analysis_id, from_number))
+            
+    return {"status": "success"}
 
 # --- ENDPOINT: DASHBOARD UPLOAD ---
 @app.post("/analyze", response_model=AnalysisResult)
