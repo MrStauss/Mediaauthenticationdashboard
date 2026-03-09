@@ -9,6 +9,15 @@ import json
 from pathlib import Path
 import asyncio
 from datetime import datetime
+import os
+from dotenv import load_dotenv # Add python-dotenv to requirements.txt
+
+# Load local .env file if it exists (for local testing only)
+load_dotenv()
+
+# Read from Environment Variables
+TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
+TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 
 # New Imports for Provenance and Messaging
 import c2pa
@@ -66,19 +75,44 @@ def verify_c2pa_provenance(file_path: Path):
 # --- ENDPOINT 1: WHATSAPP WEBHOOK ---
 @app.post("/webhook/whatsapp")
 async def whatsapp_webhook(request: Request):
-    """Handles incoming media from WhatsApp (via Twilio)"""
     form_data = await request.form()
     media_url = form_data.get('MediaUrl0')
     from_number = form_data.get('From')
 
     response = MessagingResponse()
-    if not media_url:
-        response.message("Please send a photo or video to verify.")
-        return str(response)
+    
+    if media_url:
+        # 1. Setup identification
+        analysis_id = str(uuid.uuid4())[:12]
+        file_path = UPLOAD_DIR / f"{analysis_id}.jpg"
+        
+        # 2. Download the actual image file from Twilio
+        async with httpx.AsyncClient() as client:
+            # Twilio's MediaUrl is public but expiring; we fetch it immediately
+            media_resp = await client.get(media_url)
+            if media_resp.status_code == 200:
+                with open(file_path, "wb") as f:
+                    f.write(media_resp.content)
+                
+                # 3. Create the Database Record for the Dashboard
+                analysis_db[analysis_id] = AnalysisResult(
+                    id=analysis_id, 
+                    filename=f"whatsapp_{analysis_id}.jpg", 
+                    status="processing",
+                    trust_score=0.0, verdict="pending", confidence="low",
+                    metadata_score=0.0, forensic_score=0.0, details={}, 
+                    created_at=datetime.utcnow().isoformat()
+                )
+                
+                # 4. Trigger the Background Analysis (Phase 2-4)
+                asyncio.create_task(process_analysis(analysis_id, file_path))
+                
+                response.message("🔍 Analysis started! I'm checking the digital 'Content Credentials' and forensic patterns. I'll text you the verdict shortly.")
+            else:
+                response.message("❌ I couldn't download the media. Please try sending it again.")
+    else:
+        response.message("👋 Send me a photo or video, and I'll tell you if it's AI-doctored!")
 
-    # In a real build, you'd use 'httpx' to download the media_url to UPLOAD_DIR
-    # and then trigger the analysis. For now, we acknowledge:
-    response.message(f"🔍 Received! Analyzing your media for AI signatures and forensic anomalies...")
     return str(response)
 
 # --- ENDPOINT 2: DASHBOARD UPLOAD ---
