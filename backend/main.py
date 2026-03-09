@@ -1,40 +1,33 @@
-from fastapi import FastAPI, File, UploadFile, HTTPException, Form, Request
+from fastapi import FastAPI, File, UploadFile, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Optional, Dict, Any
-import uvicorn
-import uuid
-import shutil
-import json
+from typing import Dict, Any, Optional
+import uvicorn, uuid, shutil, asyncio, os, httpx
 from pathlib import Path
-import asyncio
 from datetime import datetime
-import os
-import httpx
 from dotenv import load_dotenv
-
-# New Imports for Provenance and Messaging
-import c2pa
 from twilio.twiml.messaging_response import MessagingResponse
 from twilio.rest import Client
+import c2pa
 
-# Load environment variables
 load_dotenv()
 
+# --- CONFIGURATION & SECRETS ---
+# These must be set in your Railway Variables tab
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
-TWILIO_WHATSAPP_NUMBER = os.getenv("TWILIO_WHATSAPP_NUMBER", "whatsapp:+14155238886")
+TWILIO_NUMBER = os.getenv("TWILIO_WHATSAPP_NUMBER", "whatsapp:+14155238886")
+DATABASE_URL = os.getenv("DATABASE_URL") # For your Postgres service
 
 app = FastAPI(
     title="Media Authentication API",
-    description="AI-powered media forensics and authentication",
+    description="Full-stack prototype for AI media forensics",
     version="1.1.0"
 )
 
-# CORS configuration
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:3000"],
+    allow_origins=["*"], # In production, replace with your specific domain
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -55,140 +48,126 @@ class AnalysisResult(BaseModel):
     details: Dict[str, Any]
     created_at: str
 
+# In-memory store for the prototype (Postgres integration would replace this)
 analysis_db: Dict[str, AnalysisResult] = {}
 
-# --- HELPER: C2PA TRUTH LAYER ---
+# --- PHASE 2: PROVENANCE (C2PA) ---
 def verify_c2pa_provenance(file_path: Path):
+    """Checks for cryptographic 'Content Credentials' as seen in Figma Phase 2"""
     try:
         reader = c2pa.Reader.from_file(str(file_path))
         manifest = reader.get_active_manifest()
         is_ai = any(a['label'] == 'c2pa.ai_generated' for a in manifest.v1_manifest.get('assertions', []))
         return {
-            "exists": True,
-            "issuer": manifest.v1_manifest.get("signature_info", {}).get("issuer"),
-            "is_ai_declared": is_ai,
+            "exists": True, 
+            "issuer": manifest.v1_manifest.get("signature_info", {}).get("issuer"), 
             "score": 100 if not is_ai else 50
         }
-    except Exception:
+    except:
         return {"exists": False, "score": 0}
 
-# --- BACKGROUND PROCESSOR ---
+# --- PHASE 5: THE PROACTIVE REPLY ---
 async def process_analysis(analysis_id: str, file_path: Path, to_number: Optional[str] = None):
-    """The 5-Phase Decision Engine with Proactive Messaging"""
+    """The Decision Engine that pushes results back to WhatsApp"""
     result = analysis_db[analysis_id]
     
-    # Phase 2: Truth Layer (C2PA)
+    # 1. Run C2PA Check
     c2pa_data = verify_c2pa_provenance(file_path)
-    metadata_score = c2pa_data["score"]
-
-    # Phase 3: Forensic Layer (Mocked for Prototype)
-    await asyncio.sleep(3) # Simulating heavy AI processing
-    forensic_score = 85.0 
-
-    # Phase 4: Weighted Scoring
+    
+    # 2. Simulate Phase 3 Forensics (Hugging Face Inference)
+    await asyncio.sleep(4) 
+    forensic_score = 88.0 # Placeholder for model output
+    
+    # 3. Phase 4: Weighted Scoring
     if c2pa_data["exists"]:
-        trust_score = (metadata_score * 0.6) + (forensic_score * 0.4)
+        trust_score = (c2pa_data["score"] * 0.6) + (forensic_score * 0.4)
     else:
         trust_score = forensic_score
+        
+    verdict = "authentic" if trust_score > 80 else "manipulated"
+    conf = "high" if abs(trust_score - 50) > 30 else "medium"
 
-    # Determine Verdict
-    if trust_score > 80: verdict, conf = "authentic", "high"
-    elif trust_score > 50: verdict, conf = "suspicious", "medium"
-    else: verdict, conf = "manipulated", "high"
-
-    # Update DB
+    # 4. Update Database
     result.status = "completed"
     result.trust_score = trust_score
     result.verdict = verdict
     result.confidence = conf
-    result.metadata_score = metadata_score
+    result.metadata_score = c2pa_data["score"]
     result.forensic_score = forensic_score
-    result.details = {
-        "c2pa_present": c2pa_data["exists"],
-        "issuer": c2pa_data.get("issuer", "None"),
-        "forensic_findings": "No significant pixel anomalies detected."
-    }
+    result.details = {"c2pa_issuer": c2pa_data.get("issuer", "N/A")}
     analysis_db[analysis_id] = result
 
-    # Phase 5: Proactive WhatsApp Notification
+    # 5. Push Result back to User via Twilio
     if to_number and TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN:
         try:
             client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-            emoji = "✅" if verdict == "authentic" else "🚨" if verdict == "manipulated" else "⚠️"
-            
-            message_body = (
-                f"{emoji} *Media Analysis Complete*\n\n"
-                f"*Verdict:* {verdict.upper()}\n"
-                f"*Trust Score:* {int(trust_score)}%\n"
-                f"*Confidence:* {conf}\n\n"
-                f"View your dashboard for details."
-            )
-            
+            emoji = "✅" if verdict == "authentic" else "🚨"
             client.messages.create(
-                from_=TWILIO_WHATSAPP_NUMBER,
-                body=message_body,
-                to=to_number
+                from_=TWILIO_NUMBER,
+                to=to_number,
+                body=(
+                    f"{emoji} *Media Verdict Ready*\n\n"
+                    f"*Status:* {verdict.upper()}\n"
+                    f"*Trust Score:* {int(trust_score)}%\n\n"
+                    f"Check the full report on your MediaAuth Dashboard."
+                )
             )
         except Exception as e:
-            print(f"Failed to send proactive WhatsApp: {e}")
+            print(f"Twilio Notify Error: {e}")
 
-# --- ENDPOINTS ---
+# --- ENDPOINT: WHATSAPP WEBHOOK ---
 @app.post("/webhook/whatsapp")
 async def whatsapp_webhook(request: Request):
     form_data = await request.form()
     media_url = form_data.get('MediaUrl0')
     from_number = form_data.get('From')
-
-    response = MessagingResponse()
     
+    tw_resp = MessagingResponse()
     if media_url:
-        analysis_id = str(uuid.uuid4())[:12]
-        file_path = UPLOAD_DIR / f"{analysis_id}.jpg"
+        aid = str(uuid.uuid4())[:12]
+        path = UPLOAD_DIR / f"{aid}.jpg"
         
         async with httpx.AsyncClient() as client:
-            media_resp = await client.get(media_url)
-            if media_resp.status_code == 200:
-                with open(file_path, "wb") as f:
-                    f.write(media_resp.content)
+            resp = await client.get(media_url)
+            if resp.status_code == 200:
+                with open(path, "wb") as f: f.write(resp.content)
                 
-                analysis_db[analysis_id] = AnalysisResult(
-                    id=analysis_id, filename=f"whatsapp_{analysis_id}.jpg", 
-                    status="processing", trust_score=0.0, verdict="pending", 
-                    confidence="low", metadata_score=0.0, forensic_score=0.0, 
-                    details={}, created_at=datetime.utcnow().isoformat()
+                # Initialize analysis record
+                analysis_db[aid] = AnalysisResult(
+                    id=aid, filename=f"wa_{aid}.jpg", status="processing",
+                    trust_score=0.0, verdict="pending", confidence="low",
+                    metadata_score=0.0, forensic_score=0.0, details={},
+                    created_at=datetime.utcnow().isoformat()
                 )
                 
-                # Pass from_number to ensure the bot can reply back
-                asyncio.create_task(process_analysis(analysis_id, file_path, from_number))
-                
-                response.message("🔍 Analysis started! I'll check the metadata and forensic patterns. I'll text you the verdict shortly.")
+                # Start Background Engine
+                asyncio.create_task(process_analysis(aid, path, from_number))
+                tw_resp.message("🔍 Media received. I'm verifying the digital signatures and pixel patterns now...")
             else:
-                response.message("❌ I couldn't download the media. Please try again.")
+                tw_resp.message("❌ Could not process image. Please try again.")
     else:
-        response.message("👋 Send me a photo, and I'll tell you if it's AI-doctored!")
+        tw_resp.message("👋 Welcome! Send me a photo or video for instant verification.")
+        
+    return str(tw_resp)
 
-    return str(response)
-
+# --- ENDPOINT: DASHBOARD UPLOAD ---
 @app.post("/analyze", response_model=AnalysisResult)
 async def analyze_media(file: UploadFile = File(...)):
-    analysis_id = str(uuid.uuid4())[:12]
-    file_ext = file.filename.split('.')[-1]
-    file_path = UPLOAD_DIR / f"{analysis_id}.{file_ext}"
+    aid = str(uuid.uuid4())[:12]
+    path = UPLOAD_DIR / f"{aid}_{file.filename}"
     
-    with open(file_path, "wb") as buffer:
+    with open(path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
-    
+        
     result = AnalysisResult(
-        id=analysis_id, filename=file.filename, status="processing",
+        id=aid, filename=file.filename, status="processing",
         trust_score=0.0, verdict="pending", confidence="low",
-        metadata_score=0.0, forensic_score=0.0,
-        details={"message": "Processing via Dashboard..."},
+        metadata_score=0.0, forensic_score=0.0, details={},
         created_at=datetime.utcnow().isoformat()
     )
-    analysis_db[analysis_id] = result
-    asyncio.create_task(process_analysis(analysis_id, file_path))
-    
+    analysis_db[aid] = result
+    asyncio.create_task(process_analysis(aid, path))
     return result
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
